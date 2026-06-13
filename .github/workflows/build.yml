@@ -1,0 +1,479 @@
+name: Build VPN Locker APK (Enhanced)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Create project files
+      run: |
+        mkdir -p app/src/main/java/com/example/vpnlocker
+        mkdir -p app/src/main/res/layout
+        mkdir -p app/src/main/res/xml
+        mkdir -p app/src/main/res/values
+        mkdir -p app/src/main/res/drawable
+
+        cat > app/src/main/res/drawable/ic_launcher.xml << 'ENDOFFILE'
+        <?xml version="1.0" encoding="utf-8"?>
+        <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+            <item android:drawable="@android:color/holo_blue_dark"/>
+            <item android:drawable="@android:drawable/ic_lock_lock"/>
+        </layer-list>
+        ENDOFFILE
+
+        cat > app/src/main/AndroidManifest.xml << 'ENDOFFILE'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+            package="com.example.vpnlocker">
+
+            <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+            <application
+                android:allowBackup="true"
+                android:icon="@drawable/ic_launcher"
+                android:label="VPN Locker"
+                android:supportsRtl="true"
+                android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+
+                <activity android:name=".MainActivity"
+                    android:exported="true">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                        <category android:name="android.intent.category.LAUNCHER" />
+                    </intent-filter>
+                </activity>
+
+                <receiver android:name=".AdminReceiver"
+                    android:permission="android.permission.BIND_DEVICE_ADMIN"
+                    android:exported="true">
+                    <meta-data
+                        android:name="android.app.device_admin"
+                        android:resource="@xml/device_admin" />
+                    <intent-filter>
+                        <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                    </intent-filter>
+                </receiver>
+
+                <service android:name=".VPNMonitorService"
+                    android:foregroundServiceType="dataSync"
+                    android:exported="false" />
+
+            </application>
+        </manifest>
+        ENDOFFILE
+
+        cat > app/src/main/java/com/example/vpnlocker/AdminReceiver.kt << 'ENDOFFILE'
+        package com.example.vpnlocker
+
+        import android.app.admin.DeviceAdminReceiver
+        import android.content.Context
+        import android.content.Intent
+        import android.widget.Toast
+
+        class AdminReceiver : DeviceAdminReceiver() {
+            override fun onEnabled(context: Context, intent: Intent) {
+                super.onEnabled(context, intent)
+                Toast.makeText(context, "Admin enabled", Toast.LENGTH_SHORT).show()
+            }
+            override fun onDisabled(context: Context, intent: Intent) {
+                super.onDisabled(context, intent)
+                Toast.makeText(context, "Admin disabled", Toast.LENGTH_LONG).show()
+            }
+        }
+        ENDOFFILE
+
+        cat > app/src/main/java/com/example/vpnlocker/LockManager.kt << 'ENDOFFILE'
+        package com.example.vpnlocker
+
+        import android.app.admin.DevicePolicyManager
+        import android.content.ComponentName
+        import android.content.Context
+        import android.content.Intent
+        import android.content.IntentFilter
+
+        class LockManager private constructor(private val context: Context) {
+            private val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
+            private val adminComponent = ComponentName(context, AdminReceiver::class.java)
+            private var lockUntil = 0L
+            private var isLockActive = false
+            private var unlockReceiver: UnlockReceiver? = null
+
+            companion object {
+                @Volatile private var instance: LockManager? = null
+                fun getInstance(context: Context): LockManager {
+                    return instance ?: synchronized(this) {
+                        instance ?: LockManager(context.applicationContext).also { instance = it }
+                    }
+                }
+            }
+
+            fun startOneHourLock() {
+                if (!isAdminActive()) {
+                    android.widget.Toast.makeText(context, "Device admin not active!", android.widget.Toast.LENGTH_SHORT).show()
+                    return
+                }
+                lockUntil = System.currentTimeMillis() + 3600000
+                isLockActive = true
+                dpm.lockNow()
+                android.widget.Toast.makeText(context, "VPN detected! Screen locked for 1 hour.", android.widget.Toast.LENGTH_LONG).show()
+                startUnlockMonitoring()
+                VPNMonitorService.showLockNotification(context)
+            }
+
+            private fun startUnlockMonitoring() {
+                if (unlockReceiver == null) {
+                    unlockReceiver = UnlockReceiver()
+                    context.registerReceiver(unlockReceiver, IntentFilter(Intent.ACTION_USER_PRESENT))
+                }
+            }
+
+            fun onUserPresent() {
+                if (!isLockActive) return
+                if (System.currentTimeMillis() < lockUntil) {
+                    dpm.lockNow()
+                } else {
+                    stopLock()
+                }
+            }
+
+            private fun stopLock() {
+                isLockActive = false
+                unlockReceiver?.let {
+                    context.unregisterReceiver(it)
+                    unlockReceiver = null
+                }
+                VPNMonitorService.cancelLockNotification(context)
+            }
+
+            private fun isAdminActive() = dpm.isAdminActive(adminComponent)
+        }
+        ENDOFFILE
+
+        cat > app/src/main/java/com/example/vpnlocker/UnlockReceiver.kt << 'ENDOFFILE'
+        package com.example.vpnlocker
+
+        import android.content.BroadcastReceiver
+        import android.content.Context
+        import android.content.Intent
+
+        class UnlockReceiver : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action == Intent.ACTION_USER_PRESENT) {
+                    LockManager.getInstance(context).onUserPresent()
+                }
+            }
+        }
+        ENDOFFILE
+
+        cat > app/src/main/java/com/example/vpnlocker/VPNMonitorService.kt << 'ENDOFFILE'
+        package com.example.vpnlocker
+
+        import android.app.Notification
+        import android.app.NotificationChannel
+        import android.app.NotificationManager
+        import android.app.Service
+        import android.content.Context
+        import android.content.Intent
+        import android.net.ConnectivityManager
+        import android.net.Network
+        import android.net.NetworkCapabilities
+        import android.net.NetworkRequest
+        import android.os.Handler
+        import android.os.IBinder
+        import android.os.Looper
+        import androidx.core.app.NotificationCompat
+
+        class VPNMonitorService : Service() {
+            private lateinit var connectivityManager: ConnectivityManager
+            private lateinit var callback: ConnectivityManager.NetworkCallback
+            private var isVpnConnected = false
+            private val handler = Handler(Looper.getMainLooper())
+            private lateinit var periodicCheck: Runnable
+
+            override fun onCreate() {
+                super.onCreate()
+                connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                createNotificationChannels()
+            }
+
+            override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                startForeground(NOTIFICATION_ID, createStatusNotification())
+                registerNetworkCallback()
+                startPeriodicVpnCheck()
+                return START_STICKY
+            }
+
+            private fun registerNetworkCallback() {
+                callback = object : ConnectivityManager.NetworkCallback() {
+                    override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                        checkVpn(caps)
+                    }
+                    override fun onLost(network: Network) {
+                        isVpnConnected = false
+                    }
+                }
+                val request = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+                connectivityManager.registerNetworkCallback(request, callback)
+            }
+
+            private fun checkVpn(caps: NetworkCapabilities) {
+                val nowVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                if (nowVpn && !isVpnConnected) {
+                    isVpnConnected = true
+                    LockManager.getInstance(this@VPNMonitorService).startOneHourLock()
+                } else if (!nowVpn) {
+                    isVpnConnected = false
+                }
+            }
+
+            private fun startPeriodicVpnCheck() {
+                periodicCheck = object : Runnable {
+                    override fun run() {
+                        val activeNetwork = connectivityManager.activeNetwork ?: return
+                        val caps = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return
+                        checkVpn(caps)
+                        handler.postDelayed(this, 5000) // كل 5 ثواني
+                    }
+                }
+                handler.post(periodicCheck)
+            }
+
+            override fun onBind(intent: Intent?): IBinder? = null
+
+            override fun onDestroy() {
+                connectivityManager.unregisterNetworkCallback(callback)
+                handler.removeCallbacks(periodicCheck)
+                super.onDestroy()
+            }
+
+            private fun createStatusNotification(): Notification {
+                return NotificationCompat.Builder(this, CHANNEL_SERVICE)
+                    .setContentTitle("VPN Locker Active")
+                    .setContentText("Monitoring VPN connection")
+                    .setSmallIcon(android.R.drawable.ic_lock_lock)
+                    .setPriority(NotificationCompat.PRIORITY_LOW)
+                    .setOngoing(true)
+                    .build()
+            }
+
+            private fun createNotificationChannels() {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                val serviceChannel = NotificationChannel(CHANNEL_SERVICE, "Service", NotificationManager.IMPORTANCE_LOW)
+                nm.createNotificationChannel(serviceChannel)
+                val lockChannel = NotificationChannel(CHANNEL_LOCK, "Lock Alert", NotificationManager.IMPORTANCE_HIGH)
+                lockChannel.setShowBadge(true)
+                nm.createNotificationChannel(lockChannel)
+            }
+
+            companion object {
+                const val CHANNEL_SERVICE = "vpn_locker_service"
+                const val CHANNEL_LOCK = "vpn_locker_lock"
+                const val NOTIFICATION_ID = 101
+                const val LOCK_NOTIFICATION_ID = 102
+
+                fun showLockNotification(context: Context) {
+                    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    val notification = NotificationCompat.Builder(context, CHANNEL_LOCK)
+                        .setContentTitle("Phone Locked by VPN")
+                        .setContentText("Locked for 1 hour. Cannot be unlocked.")
+                        .setSmallIcon(android.R.drawable.ic_lock_lock)
+                        .setOngoing(true)
+                        .setPriority(NotificationCompat.PRIORITY_HIGH)
+                        .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                        .build()
+                    manager.notify(LOCK_NOTIFICATION_ID, notification)
+                }
+
+                fun cancelLockNotification(context: Context) {
+                    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    manager.cancel(LOCK_NOTIFICATION_ID)
+                }
+            }
+        }
+        ENDOFFILE
+
+        cat > app/src/main/java/com/example/vpnlocker/MainActivity.kt << 'ENDOFFILE'
+        package com.example.vpnlocker
+
+        import android.app.admin.DevicePolicyManager
+        import android.content.ComponentName
+        import android.content.Intent
+        import android.os.Bundle
+        import android.widget.Button
+        import androidx.appcompat.app.AppCompatActivity
+
+        class MainActivity : AppCompatActivity() {
+            override fun onCreate(savedInstanceState: Bundle?) {
+                super.onCreate(savedInstanceState)
+                setContentView(R.layout.activity_main)
+
+                findViewById<Button>(R.id.btn_enable_admin).setOnClickListener {
+                    val intent = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                    intent.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, ComponentName(this, AdminReceiver::class.java))
+                    intent.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "Enable device admin to lock screen on VPN.")
+                    startActivityForResult(intent, 1)
+                }
+
+                findViewById<Button>(R.id.btn_start_service).setOnClickListener {
+                    startService(Intent(this, VPNMonitorService::class.java))
+                }
+            }
+        }
+        ENDOFFILE
+
+        cat > app/src/main/res/layout/activity_main.xml << 'ENDOFFILE'
+        <?xml version="1.0" encoding="utf-8"?>
+        <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:padding="24dp"
+            android:gravity="center">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="VPN Locker"
+                android:textSize="24sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="40dp"/>
+
+            <Button
+                android:id="@+id/btn_enable_admin"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Enable Device Admin"
+                android:layout_marginBottom="16dp"/>
+
+            <Button
+                android:id="@+id/btn_start_service"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Start Monitoring Service"/>
+
+        </LinearLayout>
+        ENDOFFILE
+
+        cat > app/src/main/res/xml/device_admin.xml << 'ENDOFFILE'
+        <?xml version="1.0" encoding="utf-8"?>
+        <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-policies>
+                <force-lock />
+            </uses-policies>
+        </device-admin>
+        ENDOFFILE
+
+        cat > app/src/main/res/values/strings.xml << 'ENDOFFILE'
+        <resources>
+            <string name="app_name">VPN Locker</string>
+        </resources>
+        ENDOFFILE
+
+        cat > build.gradle << 'ENDOFFILE'
+        buildscript {
+            ext.kotlin_version = '1.9.24'
+            repositories {
+                google()
+                mavenCentral()
+            }
+            dependencies {
+                classpath 'com.android.tools.build:gradle:8.7.0'
+                classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+            }
+        }
+        ENDOFFILE
+
+        cat > app/build.gradle << 'ENDOFFILE'
+        plugins {
+            id 'com.android.application'
+            id 'kotlin-android'
+        }
+
+        android {
+            namespace 'com.example.vpnlocker'
+            compileSdk 35
+
+            defaultConfig {
+                applicationId "com.example.vpnlocker"
+                minSdk 24
+                targetSdk 35
+                versionCode 2
+                versionName "1.1"
+            }
+
+            buildTypes {
+                release {
+                    minifyEnabled false
+                    proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+                }
+            }
+            compileOptions {
+                sourceCompatibility JavaVersion.VERSION_17
+                targetCompatibility JavaVersion.VERSION_17
+            }
+            kotlinOptions {
+                jvmTarget = '17'
+            }
+        }
+
+        dependencies {
+            implementation 'androidx.core:core-ktx:1.13.1'
+            implementation 'androidx.appcompat:appcompat:1.7.0'
+            implementation 'com.google.android.material:material:1.12.0'
+        }
+        ENDOFFILE
+
+        cat > settings.gradle << 'ENDOFFILE'
+        pluginManagement {
+            repositories {
+                google()
+                mavenCentral()
+                gradlePluginPortal()
+            }
+        }
+        dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories {
+                google()
+                mavenCentral()
+            }
+        }
+        rootProject.name = "VPNLocker"
+        include ':app'
+        ENDOFFILE
+
+        cat > gradle.properties << 'ENDOFFILE'
+        org.gradle.jvmargs=-Xmx2048m
+        android.useAndroidX=true
+        kotlin.code.style=official
+        android.nonTransitiveRClass=true
+        ENDOFFILE
+
+    - name: Generate Gradle Wrapper
+      run: gradle wrapper --gradle-version 8.10
+
+    - name: Build debug APK
+      run: ./gradlew assembleDebug
+
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: VPN-Locker-APK-v1.1
+        path: app/build/outputs/apk/debug/app-debug.apk
